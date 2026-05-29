@@ -53,19 +53,42 @@
 /*---------------------------------------------------------------------------*/
 /* Includes*/
 /*---------------------------------------------------------------------------*/
+#include "boards.h"
+#include "app_util_platform.h"
 #include "bmx055_support.h"
 #include "bmm050.h"
 #include "bma2x2.h"
 #include "bmg160.h"
 #include "app_error.h"
 #include "nrf_drv_twi.h"
+#include "nrf_drv_timer.h"
 #include "nrf_delay.h"
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_gpio.h"
-#include "MahonyAHRS.h"
+#include "Adafruit_AHRS_Madgwick.h"
+#include "Adafruit_AHRS_NXPFusion.h"
 #include "arm_math.h"
 
+#define LOG_SENCOR_ENABLE			0
+	
+#define OUTPUT_AXIS_RAWDATA			0
+#define OUTPUT_QUAT_DATA			0
+
+#define CALIBRATE_MAG_FLAG			0
+
+#define DYNIMAIC_FUSION_ENABLE		1
+#define DYNIMAIC_IMU_GYRO_FILTER	0.2f
+
+//define quaternion data packet
+#define PACKET_HEAD					'$'
+#define PACKET_LENGTH   			(23)		//packet length of eMPL-pythonclient
+#define PACKET_DEBUG    			(1)
+#define PACKET_QUAT     			(2)
+#define PACKET_DATA     			(3)
+
+
+//BMX055 left-handed
 #define BMM050_API
 #define BMA2x2_API
 #define BMG160_API
@@ -84,22 +107,367 @@
 #define	I2C_BUFFER_LEN 				8
 #define SPI_BUFFER_LEN 				5
 
+/* TWI instance ID. */
+#define TWI_INSTANCE_ID     		0
 /* TWI instance. */
-extern const nrf_drv_twi_t m_twi;
+const nrf_drv_twi_t m_twi = NRF_DRV_TWI_INSTANCE(TWI_INSTANCE_ID);
+/* TIMER2 instance ID. */
+#define TIMER2_INSTANCE_ID     		2
+/* TIMER2 instance ID. */
+#define TIMER2_TICK_MS     			10
+
+#define REPORT_TICK_MS     			10
+/* TIMER2 instance. */
+const nrf_drv_timer_t m_timer2 = NRF_DRV_TIMER_INSTANCE(TIMER2_INSTANCE_ID);
+
+/* Indicates  notify main function starting sample sensor*/
+static volatile bool m_sampleSensorEvent = false;
+/* Indicates  notify main function starting sample sensor*/
+static volatile bool m_sendDataEvent = false;
+
+//X Y axis scale and bias offset
+float m_xMagB = 0.0f, m_xMagS = 1.0f, m_yMagB = 0.0f, m_yMagS = 1.0f, 
+	m_zMagB = 0.0f, m_zMagS = 1.0f;
+//calibrated mag value	
+float m_xMagC = 0.0f, m_yMagC = 0.0f, m_zMagC = 0.0f;
+
+float m_accX, m_accY, m_accZ, m_gyroX, m_gyroY, m_gyroZ,
+	m_magX, m_magY, m_magZ;
+float magMaxX = 0.0, magMinX = 0.0, magMaxY = 0.0, magMinY = 0.0;
+	
+float quat[4] = {0.0f};
+
 
 struct bma2x2_t bma2x2;
 struct bmm050_t bmm050;
 struct bmg160_t bmg160;
 
-//X Y axis scale and bias offset
-float xMagB = -130.0f, xMagS = 1.0f, yMagB = -75.50f, yMagS = 0.902355f;
+/**
+ * @brief Macro for converting radian to angle degree.
+ */
+#define RAD2DEG 			57.2957795f
+#define DEG2RAD 			0.017453f
+#define PI_DEG				180.0f
+#define PI_2_DEG			90.0f
 
-#define RAD2DEG 	57.295780f
-#define DEG2RAD 	0.017453f
+#define ACC_RANGE			2.0f  //2g sensitivity
+#define ACC_12BITS			2048.0f
+#define ACC_MAXMEASURE		(ACC_12BITS / ACC_RANGE)
+#define ACC_RESOLUTION		(ACC_RANGE / ACC_12BITS * 9.8f)
 
-#define GYRO_RESOLUTION		1000.0f / 30500.0f			//dynamic
-#define ACC_RESOLUTION		4.0f / 2048.0f			//dynamic
-#define MAG_RESOLUTION		0.3f					//Fixed value refered Datasheet
+#define GYRO_RESOLUTION		(1.0f / 131.2f)
+#define MAG_RESOLUTION		0.3f
+
+void nrf_twi_init (void)
+{
+    ret_code_t err_code;
+
+    const nrf_drv_twi_config_t twi_BMX055_config = {
+       .scl                = ARDUINO_SCL_PIN,
+       .sda                = ARDUINO_SDA_PIN,
+       .frequency          = NRF_TWI_FREQ_400K,
+       .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
+       .clear_bus_init     = true
+    };
+
+    err_code = nrf_drv_twi_init(&m_twi, &twi_BMX055_config, NULL, NULL);
+    APP_ERROR_CHECK(err_code);
+
+    nrf_drv_twi_enable(&m_twi);
+}
+
+#define UP_LMT	1
+#define LOW_LMT	0
+
+static void getlimit(bool isUp, const float* src, float* lmt)
+{
+	if(isUp){
+		if(*src > *lmt) 
+			*lmt = *src;}
+	else{
+		if(*src < *lmt) 
+			*lmt = *src;}
+}
+
+
+#define BYTE0(dwTemp)       ( *( (char *)(&dwTemp)	) )
+#define BYTE1(dwTemp)       ( *( (char *)(&dwTemp) + 1) )
+#define BYTE2(dwTemp)       ( *( (char *)(&dwTemp) + 2) )
+#define BYTE3(dwTemp)       ( *( (char *)(&dwTemp) + 3) )
+static void ANO_DT_Send_Senser(s16 a_x,s16 a_y,s16 a_z,
+	s16 g_x,s16 g_y,s16 g_z,
+	s16 m_x,s16 m_y,s16 m_z)
+{
+	char data_to_send[50];
+	u8 _cnt=0;
+	s16 _temp;
+	
+	data_to_send[_cnt++]=0xAA;
+	data_to_send[_cnt++]=0xAA;
+	data_to_send[_cnt++]=0x02;
+	data_to_send[_cnt++]=0;
+	
+	_temp = a_x;
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = a_y;
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = a_z;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	
+	_temp = g_x;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = g_y;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = g_z;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	
+	_temp = m_x;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = m_y;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = m_z;	
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	
+	data_to_send[3] = _cnt-4;
+	
+	u8 sum = 0;
+	for(u8 i=0;i<_cnt;i++)
+		sum += data_to_send[i];
+	data_to_send[_cnt++] = sum;
+	
+	for(uint8_t uCount = 0; uCount < _cnt; ++uCount)
+	{
+		NRF_LOG_RAW_INFO("%c", data_to_send[uCount]);
+	}
+	
+	NRF_LOG_FLUSH();
+}
+
+void ANO_DT_Send_Status(float angle_rol, float angle_pit, float angle_yaw)
+{
+	char data_to_send[50];
+	u8 _cnt=0;
+	s16 _temp;
+	s32 _temp2 = 0;
+	
+	data_to_send[_cnt++]=0xAA;
+	data_to_send[_cnt++]=0xAA;
+	data_to_send[_cnt++]=0x01;
+	data_to_send[_cnt++]=0;
+	
+	_temp = (int)(angle_rol*100);
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = (int)(angle_pit*100);
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	_temp = (int)(angle_yaw*100);
+	data_to_send[_cnt++]=BYTE1(_temp);
+	data_to_send[_cnt++]=BYTE0(_temp);
+	
+	data_to_send[_cnt++]=BYTE3(_temp2);
+	data_to_send[_cnt++]=BYTE2(_temp2);
+	data_to_send[_cnt++]=BYTE1(_temp2);
+	data_to_send[_cnt++]=BYTE0(_temp2);
+	
+	data_to_send[_cnt++] = 0;
+	
+	data_to_send[_cnt++] = 0;
+	
+	data_to_send[3] = _cnt-4;
+	
+	u8 sum = 0;
+	for(u8 i=0;i<_cnt;i++)
+		sum += data_to_send[i];
+	data_to_send[_cnt++]=sum;
+	
+	for(uint8_t uCount = 0; uCount < _cnt; ++uCount)
+	{
+		NRF_LOG_RAW_INFO("%c", data_to_send[uCount]);
+	}
+	
+	NRF_LOG_FLUSH();
+}
+
+void nrf_send_eMPLPack(void)
+{	
+	ANO_DT_Send_Status(getRoll(quat[0], quat[1], quat[2], quat[3]),
+	getPitch(quat[0], quat[1], quat[2], quat[3]),
+	getYaw(quat[0], -quat[1], quat[2], -quat[3]));
+	
+//	ANO_DT_Send_Status(Adafruit_NXPSensorFusion_getRoll(),
+//	Adafruit_NXPSensorFusion_getPitch(),
+//	Adafruit_NXPSensorFusion_getYaw());	
+		
+	ANO_DT_Send_Senser(m_accX, m_accY, m_accZ, 
+	m_gyroX, m_gyroY, m_gyroZ, 
+	m_yMagC, m_xMagC, m_zMagC);
+	
+#if OUTPUT_AXIS_RAWDATA
+	NRF_LOG_RAW_INFO(NRF_LOG_FLOAT_MARKER" ", NRF_LOG_FLOAT(m_magX));
+	NRF_LOG_RAW_INFO(NRF_LOG_FLOAT_MARKER" ", NRF_LOG_FLOAT(m_magY));	
+	NRF_LOG_RAW_INFO(NRF_LOG_FLOAT_MARKER, NRF_LOG_FLOAT(m_magZ));
+	NRF_LOG_RAW_INFO("\r\n"); 
+
+//	NRF_LOG_INFO("accX:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_accX));
+//	NRF_LOG_INFO("accY:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_accY));
+//	NRF_LOG_INFO("accZ:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_accZ));
+//	NRF_LOG_INFO("m_gyroX:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_gyroX));
+//	NRF_LOG_INFO("m_gyroY:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_gyroY));
+//	NRF_LOG_INFO("m_gyroZ:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_gyroZ));
+//	NRF_LOG_INFO("magX:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_magX));
+//	NRF_LOG_INFO("magY:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_magY));
+//	NRF_LOG_INFO("magZ:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_magZ));
+
+	//calibrate magnetmeter
+//	{
+//		NRF_LOG_INFO("magMaxX:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(magMaxX));
+//		NRF_LOG_INFO("magMinX:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(magMinX));
+//		NRF_LOG_INFO("magMaxY:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(magMaxY));
+//		NRF_LOG_INFO("magMinY:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(magMinY));
+//		
+//		if(fabs(magMaxX-magMinX) > fabs(magMaxY-magMinY))
+//		{
+//			m_xMagS = 1.0f;
+//			m_yMagS = (float)(magMaxX - magMinX) / (magMaxY - magMinY);		
+//		}
+//		else
+//		{
+//			m_xMagS = (float)(magMaxY - magMinY) / (magMaxX - magMinX);
+//			m_yMagS = 1.0f;				
+//		}
+
+//		m_xMagB = (0.5f * (magMaxX - magMinX) - magMaxX) * m_xMagS;
+//		m_yMagB = (0.5f * (magMaxY - magMinY) - magMaxY) * m_yMagS;
+//		
+//		NRF_LOG_INFO("m_xMagS:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_xMagS));
+//		NRF_LOG_INFO("m_xMagB:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_xMagB));
+//		NRF_LOG_INFO("m_yMagS:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_yMagS));
+//		NRF_LOG_INFO("m_yMagB:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_yMagB));
+//	}
+#endif
+
+#if	OUTPUT_QUAT_DATA
+
+    char out[PACKET_LENGTH];
+	int32_t qData[4] = {0};
+	float32_t fData[4] = {q0, q1, q2, q3};
+	
+	arm_float_to_q31(fData, qData, 4);
+	
+	//q31 to q30
+	qData[0] = qData[0] >> 1;
+	qData[1] = -(qData[1] >> 1);
+	qData[2] = qData[2] >> 1;
+	qData[3] = -(qData[3] >> 1);
+	
+	//convert long to char
+    out[0] = PACKET_HEAD;
+    out[1] = PACKET_QUAT;
+	
+    out[3] = (char)(qData[0] >> 24);
+    out[4] = (char)(qData[0] >> 16);
+    out[5] = (char)(qData[0] >> 8);
+    out[6] = (char)qData[0];
+	
+    out[7] = (char)(qData[1] >> 24);
+    out[8] = (char)(qData[1] >> 16);
+    out[9] = (char)(qData[1] >> 8);
+    out[10] = (char)qData[1];
+	
+    out[11] = (char)(qData[2] >> 24);
+    out[12] = (char)(qData[2] >> 16);
+    out[13] = (char)(qData[2] >> 8);
+    out[14] = (char)qData[2];
+	
+    out[15] = (char)(qData[3] >> 24);
+    out[16] = (char)(qData[3] >> 16);
+    out[17] = (char)(qData[3] >> 8);
+    out[18] = (char)qData[3];
+
+    out[21] = 0x0D;
+    out[22] = 0x0A;
+
+	for(uint8_t uCount = 0; uCount < PACKET_LENGTH; ++uCount)
+	{
+		NRF_LOG_RAW_INFO("%c", out[uCount]);
+	}
+	
+#endif
+	NRF_LOG_FLUSH();
+}
+
+
+
+/**
+ * @brief Handler for timer events.
+ */
+static void timer_sample_event_handler(nrf_timer_event_t event_type, void* p_context)
+{
+	static uint16_t usartRstCount = 0;
+    switch (event_type)
+    {
+        case NRF_TIMER_EVENT_COMPARE0:
+			m_sampleSensorEvent = true;
+		
+			if(usartRstCount++ > (REPORT_TICK_MS / TIMER2_TICK_MS))
+			{
+				m_sendDataEvent = true;
+				usartRstCount = 0;
+			}
+            break;
+
+        default:
+            //Do nothing.
+            break;
+    }
+}
+
+void nrf_SampleBMX055_loopRoutine(void)
+{
+	if(m_sampleSensorEvent)
+	{
+		BMX055_updateFusion();		//exec rate 100Hz
+		Adafruit_NXPSensorFusion_getQuat(quat);
+		m_sampleSensorEvent = false;			
+	}
+
+#if LOG_SENCOR_ENABLE
+	if(m_sendDataEvent)
+	{
+		nrf_send_eMPLPack();	
+		m_sendDataEvent = false;
+	}	
+#endif
+}
+
+void nrf_timer_SampleBMX055_init(void)
+{
+    uint32_t time_ms = TIMER2_TICK_MS; //Time(in miliseconds) between consecutive compare events.
+    uint32_t time_ticks;
+    uint32_t err_code = NRF_SUCCESS;
+
+    //Configure m_timer2 for generating simple light effect - leds on board will invert his state one after the other.
+    nrf_drv_timer_config_t timer_cfg = NRF_DRV_TIMER_DEFAULT_CONFIG;
+    err_code = nrf_drv_timer_init(&m_timer2, &timer_cfg, timer_sample_event_handler);
+    APP_ERROR_CHECK(err_code);
+
+    time_ticks = nrf_drv_timer_ms_to_ticks(&m_timer2, time_ms);
+
+    nrf_drv_timer_extended_compare(
+         &m_timer2, NRF_TIMER_CC_CHANNEL0, time_ticks, NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK, true);
+
+    nrf_drv_timer_enable(&m_timer2);	
+}
 
 /*----------------------------------------------------------------------------*
 *	The following functions are used for reading and writing of
@@ -909,7 +1277,7 @@ void BMG160_delay_msek(u32 msek)
 #endif
 
 
-char BMX055_config(void)
+char BMX055_init(void)
 {
 	/* status of communication*/
 	s8 com_rslt = SUCCESS;
@@ -930,37 +1298,45 @@ char BMX055_config(void)
 	com_rslt += bmm050_init(&bmm050);
 	
 	APP_ERROR_CHECK(com_rslt);
-	NRF_LOG_INFO("\r\nbma2x2_ID:0x%02X\tbmg160_ID:0x%02X\tbmm050_ID:0x%02X", 
-	bma2x2.chip_id, bmg160.chip_id, bmm050.company_id);
 	
 	com_rslt += bma2x2_set_power_mode(BMA2x2_MODE_NORMAL);
 	com_rslt += bmg160_set_power_mode(BMG160_MODE_NORMAL);
 	com_rslt += bmm050_set_functional_state(BMM050_NORMAL_MODE);
 	
-	/* set bandwidth of ?Hz*/
+	/* set bandwidth of 250Hz*/
 	com_rslt += bma2x2_set_bw(BMA2x2_BW_250HZ);	
-	/* set accelerometer range ?G*/
-	com_rslt += bma2x2_set_range(BMA2x2_RANGE_4G);	
+	/* set accelerometer range 2G*/
+	com_rslt += bma2x2_set_range(BMA2x2_RANGE_2G);	
 	
-	/* set gyro bandwidth of ?Hz*/
-	com_rslt += bmg160_set_bw(C_BMG160_BW_230HZ_U8X);
-	/* set gyro range ? degree per second*/
-	com_rslt += bmg160_set_range_reg(BMG160_RANGE_1000);
+	/* set gyro bandwidth of 230Hz*/
+	com_rslt += bmg160_set_bw(BMG160_BW_230_HZ);
+	/* set gyro range 250 degree per second*/
+	com_rslt += bmg160_set_range_reg(BMG160_RANGE_250);
 
 	/* set magnetomenter data rate of 30Hz*/
-	com_rslt += bmm050_set_data_rate(BMM050_DATA_RATE_30HZ);
+	com_rslt += bmm050_set_data_rate(BMM050_DATA_RATE_25HZ);
 
 	return com_rslt;
 }
 
-char BMX055_CalOrientation(void)
+char BMX055_axisCompensation(void)
 {
 	s8 com_rslt = SUCCESS;
 	
+	//set accelerometer slow compensation
+	com_rslt +=	bma2x2_set_slow_comp(0, 1);
+	com_rslt +=	bma2x2_set_slow_comp(1, 1);
+	com_rslt +=	bma2x2_set_slow_comp(2, 1);
+	
+	com_rslt +=	bmg160_set_offset_unfilt(BMG160_SLOW_OFFSET, BMG160_ENABLE);
+	com_rslt +=	bmg160_set_slow_offset_enable_axis(0, 1);
+	com_rslt +=	bmg160_set_slow_offset_enable_axis(1, 1);
+	com_rslt +=	bmg160_set_slow_offset_enable_axis(2, 1);
+	
 	return com_rslt;
 }
 
-char BMX055_CalibrateMag(char bConfigMag)
+char BMX055_calibrateMag(char bConfigMag)
 {
 	/* Structure used for read the mag xyz data*/
 	struct bmm050_mag_data_s16_t tMagData;
@@ -971,6 +1347,10 @@ char BMX055_CalibrateMag(char bConfigMag)
 	if(!bConfigMag)
 		return com_rslt;
 	
+	NRF_LOG_INFO("start calibrating magnetometer...\r\n");
+	NRF_LOG_FLUSH();
+	nrf_delay_ms(500);
+	
 	while(bConfigMag)
 	{
 		com_rslt += bmm050_read_mag_data_XYZ(&tMagData);
@@ -979,7 +1359,7 @@ char BMX055_CalibrateMag(char bConfigMag)
 		if(tMagData.datay > yMagMax) yMagMax = tMagData.datay;
 		if(tMagData.datay < yMagMin) yMagMin = tMagData.datay;
 		
-		if(++NumConfig < 800)	//sample 12 sec
+		if(++NumConfig < 400)	//sample 6 sec
 		{
 			nrf_delay_ms(15); 	//sample rate >= 60Hz(double magnetometer data sample rate)
 		}
@@ -990,76 +1370,97 @@ char BMX055_CalibrateMag(char bConfigMag)
 		}
 	}
 	
-	xMagS = 1.0f;
-	yMagS = (float)(xMagMax - xMagMin) / (yMagMax - yMagMin);
-	xMagB = -0.5f * (xMagMax + xMagMin) * xMagS;
-	yMagB = -0.5f * (yMagMax + yMagMin) * yMagS;
+	if(abs(xMagMax-xMagMin) > abs(yMagMax-yMagMin))
+	{
+		m_xMagS = 1.0f;
+		m_yMagS = (float)(xMagMax - xMagMin) / (yMagMax - yMagMin);		
+	}
+	else
+	{
+		m_xMagS = (float)(yMagMax - yMagMin) / (xMagMax - xMagMin);
+		m_yMagS = 1.0f;				
+	}
+
+	m_xMagB = (0.5f * (xMagMax - xMagMin) - xMagMax) * m_xMagS;
+	m_yMagB = (0.5f * (yMagMax - yMagMin) - yMagMax) * m_yMagS;
 	
+	NRF_LOG_INFO("m_xMagS:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_xMagS));
+	NRF_LOG_INFO("m_xMagB:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_xMagB));
+	NRF_LOG_INFO("m_yMagS:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_yMagS));
+	NRF_LOG_INFO("m_yMagB:" NRF_LOG_FLOAT_MARKER "\r\n", NRF_LOG_FLOAT(m_yMagB));
+	NRF_LOG_FLUSH();
 	return com_rslt;
 }
 
-void BMX055_updateAHRS(void)
+void BMX055_setMagCalib(float xMagS, float xMagB, float yMagS, float yMagB, float zMagS, float zMagB)
 {
-	/* structure used for read the sensor data - xyz*/
-	struct bmg160_data_t data_gyro;
-	/* bma2x2acc_data structure used to read accel xyz data*/
-	struct bma2x2_accel_data data_acc;
-	/* Structure used for read the mag xyz data*/
-	struct bmm050_mag_data_s16_t data_mag;
-	float xMagC = 0.0f, yMagC = 0.0f;
-	
-
-	bmg160_get_data_XYZ(&data_gyro);
-	bma2x2_read_accel_xyz(&data_acc);
-	/* Intermittent reading read mag value*/
-	bmm050_read_mag_data_XYZ(&data_mag);
-	
-	xMagC = data_mag.datax + xMagB;
-	yMagC = data_mag.datay * yMagS + yMagB;
-	
-	MahonyAHRSupdate(data_gyro.datax * DEG2RAD * GYRO_RESOLUTION, data_gyro.datay * DEG2RAD * GYRO_RESOLUTION, data_gyro.dataz * DEG2RAD * GYRO_RESOLUTION,
-	data_acc.x * ACC_RESOLUTION, data_acc.y * ACC_RESOLUTION, data_acc.z * ACC_RESOLUTION,
-	xMagC * MAG_RESOLUTION, yMagC * MAG_RESOLUTION, data_mag.dataz * MAG_RESOLUTION);
+	m_xMagS = xMagS;
+	m_yMagS = yMagS;
+	m_zMagS = zMagS;
+	m_xMagB = xMagB;
+	m_yMagB = yMagB;
+	m_zMagB = zMagB;
 }
 
-void BMX055_updateIMU(void)
+void BMX055_getMagCalib(float* xMagS, float* xMagB, float* yMagS, float* yMagB, float* zMagS, float* zMagB)
 {
-	/* structure used for read the sensor data - xyz*/
-	struct bmg160_data_t data_gyro;
-	/* bma2x2acc_data structure used to read accel xyz data*/
-	struct bma2x2_accel_data data_acc;
+	*xMagS = m_xMagS;
+	*yMagS = m_yMagS;
+	*zMagS = m_zMagS;
+	*xMagB = m_xMagB;
+	*yMagB = m_yMagB;
+	*zMagB = m_zMagB;
+}
 
-	bmg160_get_data_XYZ(&data_gyro);
-	bma2x2_read_accel_xyz(&data_acc);
+void BMX055_updateFusion(void)
+{
+	struct bmg160_data_t data_gyro;
+	struct bma2x2_accel_data data_acc;
+	struct bmm050_mag_data_s16_t data_mag;
 	
-	MahonyAHRSupdateIMU(data_gyro.datax * DEG2RAD * GYRO_RESOLUTION, data_gyro.datay * DEG2RAD * GYRO_RESOLUTION, data_gyro.dataz * DEG2RAD * GYRO_RESOLUTION,
-	data_acc.x * ACC_RESOLUTION, data_acc.y * ACC_RESOLUTION, data_acc.z * ACC_RESOLUTION);	
+	bma2x2_read_accel_xyz(&data_acc);
+	bmg160_get_data_XYZ(&data_gyro);
+	bmm050_read_mag_data_XYZ(&data_mag);
+
+	m_accX = data_acc.x * ACC_RESOLUTION;
+	m_accY = data_acc.y * ACC_RESOLUTION;
+	m_accZ = data_acc.z * ACC_RESOLUTION;
+	
+	m_gyroX = data_gyro.datax * DEG2RAD * GYRO_RESOLUTION;
+	m_gyroY = data_gyro.datay * DEG2RAD * GYRO_RESOLUTION;
+	m_gyroZ = data_gyro.dataz * DEG2RAD * GYRO_RESOLUTION;
+	
+	m_xMagC = (data_mag.datax * MAG_RESOLUTION - m_xMagB) / m_xMagS * 100;
+	m_yMagC = (data_mag.datay * MAG_RESOLUTION - m_yMagB) / m_yMagS * -100;
+	m_zMagC = (data_mag.dataz * MAG_RESOLUTION - m_zMagB) / m_zMagS * 100;
+
+	Adafruit_NXPSensorFusion_update(data_gyro.datax * GYRO_RESOLUTION, data_gyro.datay * GYRO_RESOLUTION, data_gyro.dataz * GYRO_RESOLUTION,
+	data_acc.x * ACC_RESOLUTION, data_acc.y * ACC_RESOLUTION, data_acc.z * ACC_RESOLUTION,
+	m_yMagC, m_xMagC, m_zMagC);
+}
+
+float getScreenAxisX(void)
+{
+	return getYaw(quat[0], -quat[1], quat[2], -quat[3]);
+}
+float getScreenAxisY(void)
+{
+	return getPitch(quat[0], quat[1], quat[2], quat[3]);
 }
 
 float getPitch(float q0, float q1, float q2, float q3)
 {
-	float arg1 = 2.0f * (q1*q3 + q0*q2);
-	float arg2 = sqrt(1.0f - pow((2.0f*q1*q3 + 2.0f*q0*q2), 2.0f));
-  
-	return -atan(arg1/arg2) * RAD2DEG;
+	return asin(2*q2*q3 + 2*q0*q1) * RAD2DEG;
 }
 
 float getYaw(float q0, float q1, float q2, float q3) 
 {
-	float arg1 = 2.0f*(q1*q2-q0*q3);
-	float arg2 = 2.0f*q0*q0 - 1.0f + 2.0f*q1*q1;
-  
-	return atan2(arg1,arg2)*RAD2DEG;
+	return -atan2(2*q1*q2 - 2*q0*q3, -2 * q1 * q1 - 2 * q3 * q3 + 1) * RAD2DEG - 90;
 }
 
 float getRoll(float q0, float q1, float q2, float q3)
 {
-	float arg1 = 2.0f*(q2*q3-q0*q1);
-	float arg2 = 2.0f*q0*q0 - 1.0f + 2.0f*q3*q3;
-  
-	return atan2(arg1,arg2)*RAD2DEG;
+	return -atan2(-2*q0*q2 + 2*q1*q3, -2 * q1 * q1 - 2 * q2* q2 + 1) * RAD2DEG;
 }
-
-
 
 

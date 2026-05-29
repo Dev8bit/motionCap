@@ -729,6 +729,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_set_range_reg(u8 v_range_u8)
 			v_data_u8 = BMG160_SET_BITSLICE(v_data_u8,
 			BMG160_RANGE_ADDR_RANGE,
 			v_range_u8);
+			
 			comres += p_bmg160->BMG160_BUS_WRITE_FUNC
 			(p_bmg160->dev_addr,
 			BMG160_RANGE_ADDR_RANGE__REG, &v_data_u8,
